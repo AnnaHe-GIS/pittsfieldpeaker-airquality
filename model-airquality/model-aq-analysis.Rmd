@@ -1,0 +1,1061 @@
+---
+title: "Modeling effect of peaker plant operations on air quality in Pittsfield, MA"
+author: "Anna He"
+date: "`r Sys.Date()`"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## R Markdown
+The purpose of this script is to analyze the effect of peaker power plant operations on air quality (PM2.5, PM10, and NO2 concentrations) at two locations: 
+Allendale Elementary School in Pittsfield, MA and the population-weighted centroid in Pittsfield, MA. 
+
+Air quality data from BEAT and peaker plant operations data from the EPA CAMPD were downloded for April 1, 2024 - September 30, 2025.
+The time period of analysis was Summer 2024 and Summer 2025 (June, July, and August).
+
+```{r load-libraries, warning = F, echo = F}
+library(ggplot2)
+library(pheatmap)
+library(cowplot)
+library(sf)
+library(dplyr)
+library(broom) 
+library(spdep)
+library(splines) 
+library(CARBayes) # Fitting conditional autoregressive (CAR) models
+library(tidyr) 
+library(ggmap)
+library(data.table)
+library(tidyverse)
+library(spatstat)
+library(tinytex)
+library(lubridate)
+library(gstat)
+library(stars)
+library(terra)
+library(cowplot)
+
+```
+
+## Loading the input data
+
+```{r load-data, echo=T}
+#time series air quality data from BEAT
+sensorsaq_all <- fread("data/input/sensordata_clean.csv") 
+
+#weather data (includes hourly temp, wind direction, and windspeed) from National Centers for Environmental Information 
+weather_all <- fread("data/input/WeatherClean.csv") 
+
+#sensor location and description data from BEAT
+sensorinfo <- fread("data/input/sensors.csv")
+
+#peaker plant operations data from the EPA (cleaned)
+peakerops <- fread("data/input/peakerop_clean.csv") 
+
+``` 
+
+#PART 1: JOINING AND VISUALIZING AIR QUALITY DATA 
+
+```{r 1-join-sensor-info, warning = FALSE, echo = TRUE}
+#join sensor location/name info to the time series sensor air quality data
+sensors_joined_1 <- dplyr::left_join(sensorsaq_all, sensorinfo, 
+                                     by = c("datasourceId" = "datasourceID"))
+
+head(sensors_joined_1)
+
+```
+```{r 2-join-peaker-operations, warning = FALSE, echo = TRUE}
+#join the peaker operations info to sensors air quality data
+sensors_joined_2 <- dplyr::left_join(sensors_joined_1, peakerops, 
+                                     by = c("StartOfPeriod" = "datetime"))
+
+head(sensors_joined_2)
+
+```
+
+```{r 3a-check-weather-data, warning = F, echo = T}
+#there are multiple report types, SOM, SOD (summary of month and summary of day) 
+#with null values. what happens if I remove them?
+
+weather_filtered <- weather_all |> dplyr::filter(REPORT_TYPE == "FM-15")
+head(weather_filtered)
+class(weather_filtered$HourlyWindDirection)
+table(weather_filtered$HourlyWindDirection)
+
+#There are 1041 values with variable wind direction. Should I force to be NAs?
+#decided not to include wind direction as a variable in the model
+
+```
+
+```{r 3b-join-weather-data, warning = FALSE, echo = TRUE}
+#Join the weather data to sensors air quality data
+#Got an error that there were multiple weather dates for 2025;03;08;21
+weather_test <- weather_filtered |> dplyr::filter(DATE == "2025;03;08;21")
+
+#dropped the second row because both measurements were taken at the same time based on the original weather data
+weather_filtered_unique <- weather_filtered[-8201,]
+
+sensors_joined_3 <- dplyr::left_join(sensors_joined_2, weather_filtered_unique, by = c("StartOfPeriod" = "DATE"))
+
+#sensors_joined_3 is the full dataset of sensor air quality data joined to sensor information
+#peaker plant operation information
+#and weather information
+
+head(sensors_joined_3)
+
+write.csv(sensors_joined_3, "data/output/sensors_joined_all.csv")
+```
+```{r 4-filter-to-summer, warning = FALSE, echo = TRUE}
+#filter the complete dataset to just summer 2024 and summer 2025
+sensors_summer_1 <- sensors_joined_3 |> dplyr::filter(season == "Summer")
+
+head(sensors_summer_1)
+
+``` 
+
+```{r 5-fireworks, warning = FALSE, echo = TRUE}
+#add a new column, fireworks, to represent potential July 4th covariate 
+#dates that fall on or after July 4th on a weekend may have elevated pollutants due to fireworks
+#if the date falls on the following dates, assign it a value of 1 for fireworks; otherwise, 0
+
+sensors_summer_2 <- sensors_summer_1 
+
+sensors_summer_2$fireworks <- ifelse(sensors_summer_2$date %in% c("7/4/2024", "7/5/2024", "7/6/2024", "7/7/2024", "7/4/2025", "7/5/2025", "7/6/2025"), "1", "0")
+```
+
+```{r 6-wildfire-smoke, warning = FALSE, echo = TRUE}
+#add a new column, smoke, to represent potential covariate from wildfire smoke from Canada
+#check for dates that air quality alerts were issued in summer 2024 and summer 2025 due to wildfire smoke
+#sources: local news articles, Mass DEP, Berkshire health orgs
+#if the date falls on the following dates with an air quality alert due to smoke, assign it a value of 1; otherwise 0
+
+sensors_summer_2$smoke <- ifelse(sensors_summer_2$date %in% c("8/16/2024", "6/5/2025", "7/26/2025", "7/27/2025", "8/4/2025", "8/5/2025", "8/6/2025"), "1", "0")
+
+head(sensors_summer_2)
+```
+
+```{r 7-filter-to-allendale-elementary-school, warning = FALSE, echo = TRUE}
+allendale <- sensors_summer_2 |> dplyr::filter(name == "Allendale Elementary School")
+
+#check for NAs and distribution
+table(allendale$no2Conc1HourMean.status)
+table(allendale$pm2_5ConcMass1HourMean.status)
+table(allendale$pm10ConcMass1HourMean.qcAssessment)
+
+sum(is.na(allendale$no2Conc1HourMean.value))
+sum(is.na(allendale$pm2_5ConcMass1HourMean.value))
+sum(is.na(allendale$pm10ConcMass1HourMean.raw))
+sum(is.na(allendale$HourlyDryBulbTemperature))
+sum(is.na(allendale$HourlyRelativeHumidity))
+sum(is.na(allendale$HourlyWindDirection))
+sum(is.na(allendale$HourlyWindSpeed))
+
+#all important variables have less than 5% NAs.
+#only 0.06% (3/4416) of observations are missing for pollutant concentrations
+#2.79% (123/4416) of observations are missing for temperature data
+#3.33% (147/4416) of observations are missing for humidity data
+#1.36% (60/4416) of observations are missing for hourly wind direction and wind speed
+
+#check for NAs distribution
+allendale$date[is.na(allendale$no2Conc1HourMean.value)]
+allendale$date[is.na(allendale$pm10ConcMass1HourMean.raw)]
+allendale$date[is.na(allendale$pm2_5ConcMass1HourMean.value)]
+
+allendale$date[is.na(allendale$HourlyDryBulbTemperature)]
+allendale$hour[is.na(allendale$HourlyDryBulbTemperature)]
+
+hist(allendale$hour[is.na(allendale$HourlyDryBulbTemperature)])
+
+
+
+```
+
+```{r 8a-initial-visualization-pm2.5}
+#boxplot comparing PM2.5 levels when the power plant is operating or not operating
+pm25box <- ggplot(data = allendale, aes(x = factor(operating), y = pm2_5ConcMass1HourMean.value)) + 
+  geom_boxplot(na.rm = TRUE) +
+  labs(title = "Mean hourly PM2.5 levels (µg/m3)",
+       x = "Operating (0 = No, 1 = Yes)",
+       y = "Concentration (µg/m3)") +
+  theme_minimal()+ 
+  theme(plot.title = element_text(size = 40),
+        axis.title.x = element_text(size = 30), 
+        axis.title.y = element_text(size = 30),
+        axis.text = element_text(size = 25))
+
+
+#factor by smoke
+ggplot(data = allendale, aes(x = factor(smoke), y = pm2_5ConcMass1HourMean.value)) + 
+  geom_boxplot(na.rm = TRUE) +
+  labs(title = "Mean hourly PM2.5 levels at Allendale Elementary School \nSummer 2024 and 2025",
+       x = "Smoke alerts (0 = No, 1 = Yes)",
+       y = "PM2.5 Concentration  (micrograms/m³)") +
+  theme_minimal()
+
+#factor by fireworks
+ggplot(data = allendale, aes(x = factor(fireworks), y = pm2_5ConcMass1HourMean.value)) + 
+  geom_boxplot(na.rm = TRUE) +
+  labs(title = "Mean hourly PM2.5 levels at Allendale Elementary School \nSummer 2024 and 2025",
+       x = "Smoke alerts (0 = No, 1 = Yes)",
+       y = "PM2.5 Concentration  (micrograms/m³)") +
+  theme_minimal()
+
+#factor by hour
+ggplot(data = allendale, aes(x = factor(hour), y = pm2_5ConcMass1HourMean.value)) + 
+  geom_boxplot(na.rm = TRUE) +
+  labs(title = "Mean hourly PM2.5 levels at Allendale Elementary School \nSummer 2024 and 2025",
+       x = "Hour",
+       y = "PM2.5 Concentration  (micrograms/m³)") +
+  theme_minimal()
+
+#factor by weekday
+ggplot(data = allendale, aes(x = factor(weekday_num), y = pm2_5ConcMass1HourMean.value)) + 
+  geom_boxplot(na.rm = TRUE) +
+  labs(title = "Mean hourly PM2.5 levels at Allendale Elementary School \nSummer 2024 and 2025",
+       x = "Weekday (0=No, 1 = Yes)",
+       y = "PM2.5 Concentration  (µg/m3)") +
+  theme_minimal()
+
+
+#scatterplot of PM2.5 over time
+class(allendale$date)
+allendale$date <- as.Date(allendale$date, format = "%m/%d/%Y")
+class(allendale$date)
+allendale$year <- format(allendale$date, "%Y")
+
+allendale$operating_f <- factor(allendale$operating,
+                                levels = c(0, 1),
+                                labels = c("Not operating", "Operating"))
+
+
+#plot scatterplot of data faceted by year and colored by operational status
+pm25date<- ggplot(data = allendale, aes(x = date, 
+                             y = pm2_5ConcMass1HourMean.value, 
+                             color = operating_f)) +
+  geom_point(alpha = 0.4, size = 1) +
+  facet_wrap(~year, scales = "free_x") +
+  labs(title = "Mean hourly PM2.5 levels at Allendale Elementary", 
+       x = "Date",
+       y = "Concentration (µg/m3)",
+       color = "Power plant status") +
+  theme_minimal(base_size = 16)
+
+
+ggsave("plots/pm25date.png", pm25date, width = 8, height = 6, units = "in")
+
+#plot scatterplot of data faceted by hour and colored by operational status
+#don't use, not very helpful
+ggplot(data = allendale, aes(x = hour, 
+                             y = pm2_5ConcMass1HourMean.value, 
+                             color = operating_f)) +
+  geom_point(alpha = 0.4) +
+  facet_wrap(~year, scales = "free_x") +
+  labs(title = "Hourly PM2.5 Levels at Allendale Elementary School", 
+       x = "Hour",
+       y = "PM2.5 (micrograms/cubic meters)",
+       color = "Power plant status") +
+  theme_minimal()
+
+
+
+#plot scatterplot over datetime
+allendale$datetime <- as.POSIXct(
+  paste(allendale$date, allendale$hour),
+  format = "%Y-%m-%d %H")
+
+ggplot(data = allendale, aes(x = datetime, 
+                             y = pm2_5ConcMass1HourMean.value, 
+                             color = operating_f)) +
+  geom_point(alpha = 0.4) +
+  geom_line(alpha = 0.4) +
+  facet_wrap(~year, scales = "free_x") +
+  labs(title = "Hourly PM2.5 Levels at Allendale Elementary School", 
+       x = "Date",
+       y = "PM2.5 (micrograms/cubic meters)",
+       color = "Power plant status") +
+  theme_minimal()
+
+summary(allendale$pm2_5ConcMass1HourMean.value)
+#allendale |> dplyr::group_by(operating)
+
+``` 
+
+```{r 8b-visualization-no2}
+#boxplot comparing NOX levels when the power plant is operating or not operating
+no2box <- ggplot(data = allendale, aes(x = factor(operating), y = no2Conc1HourMean.value)) + 
+  geom_boxplot(na.rm = TRUE) +
+  labs(title = "Mean hourly NO2 levels (ppb)",
+       x = "Operating (0 = No, 1 = Yes)",
+       y = "Concentration (ppb)") +
+  theme_minimal()+ 
+  theme(plot.title = element_text(size = 40),
+        axis.title.x = element_text(size = 30), 
+        axis.title.y = element_text(size = 30),
+        axis.text = element_text(size = 25))
+
+
+
+no2box
+
+no2date<- ggplot(data = allendale, aes(x = date, 
+                             y = no2Conc1HourMean.value, 
+                             color = operating_f)) +
+  geom_point(alpha = 0.4, size = 1) +
+  facet_wrap(~year, scales = "free_x") +
+  labs(title = "Mean hourly NO2 levels at Allendale Elementary", 
+       x = "Date",
+       y = "Concentration (ppb)",
+       color = "Power plant status") +
+  theme_minimal(base_size = 16)
+
+
+ggsave("plots/no2date.png", no2date, width = 8, height = 6, units = "in")
+
+```
+
+```{r 8c-visualization-pm10}
+#boxplot comparing NOX levels when the power plant is operating or not operating
+pm10box <- ggplot(data = allendale, aes(x = factor(operating), y = allendale$pm10ConcMass1HourMean.raw)) + 
+  geom_boxplot(na.rm = TRUE) +
+  labs(title = "Mean hourly PM10 levels (µg/m3)",
+       x = "Operating (0 = No, 1 = Yes)",
+       y = "Concentration (µg/m3)") +
+  theme_minimal() + 
+  theme(plot.title = element_text(size = 40),
+        axis.title.x = element_text(size = 30), 
+        axis.title.y = element_text(size = 30),
+        axis.text = element_text(size = 25))
+
+
+pm10box
+
+
+operatingbox <- cowplot::plot_grid(pm25box, pm10box, no2box)
+cowplot::save_plot("plots/operatingboxplot.png", operatingbox, base_height = 21, ncol = 1)
+
+pm10date<- ggplot(data = allendale, aes(x = date, 
+                             y = allendale$pm10ConcMass1HourMean.raw, 
+                             color = operating_f)) +
+  geom_point(alpha = 0.4, size = 1) +
+  facet_wrap(~year, scales = "free_x") +
+  labs(title = "Mean hourly PM10 levels at Allendale Elementary", 
+       x = "Date",
+       y = "Concentration (µg/m3)",
+       color = "Power plant status") +
+  theme_minimal(base_size = 16)
+
+
+ggsave("plots/pm10date.png", pm10date, width = 8, height = 6, units = "in")
+
+```
+
+```{r 8d-statistics-allendale}
+#pm2.5 statistics at allendale
+mean(allendale$pm2_5ConcMass1HourMean.value, na.rm = TRUE)
+median(allendale$pm2_5ConcMass1HourMean.value, na.rm = TRUE)
+quantile(allendale$pm2_5ConcMass1HourMean.value, na.rm = TRUE)
+sd(allendale$pm2_5ConcMass1HourMean.value, na.rm = TRUE)
+
+#pm10 statistics at allendale
+mean(allendale$pm10ConcMass1HourMean.raw, na.rm = TRUE)
+median(allendale$pm10ConcMass1HourMean.raw, na.rm = TRUE)
+quantile(allendale$pm10ConcMass1HourMean.raw, na.rm = TRUE)
+sd(allendale$pm10ConcMass1HourMean.raw, na.rm = TRUE)
+
+#no2 statistics at allendale
+mean(allendale$no2Conc1HourMean.value, na.rm = TRUE)
+median(allendale$no2Conc1HourMean.value, na.rm = TRUE)
+quantile(allendale$no2Conc1HourMean.value, na.rm = TRUE)
+sd(allendale$no2Conc1HourMean.value, na.rm = TRUE)
+
+#filter peaker power plant data when power plant is on vs. off
+allendaleon <- allendale |>filter(operating == 1)
+allendaleoff <- allendale |> filter(operating == 0)
+
+#statistics for pm2.5 at allendale when peaker is on
+mean(allendaleon$pm2_5ConcMass1HourMean.value, na.rm = TRUE)
+median(allendaleon$pm2_5ConcMass1HourMean.value, na.rm = TRUE)
+quantile(allendaleon$pm2_5ConcMass1HourMean.value, na.rm = TRUE)
+sd(allendaleon$pm2_5ConcMass1HourMean.value, na.rm = TRUE)
+
+#statistics for pm10 at allendale when peaker is on
+mean(allendaleon$pm10ConcMass1HourMean.raw, na.rm = TRUE)
+median(allendaleon$pm10ConcMass1HourMean.raw, na.rm = TRUE)
+quantile(allendaleon$pm10ConcMass1HourMean.raw, na.rm = TRUE)
+sd(allendaleon$pm10ConcMass1HourMean.raw, na.rm = TRUE)
+
+#statistics for no2 at allendale when peaker is on
+mean(allendaleon$no2Conc1HourMean.value, na.rm = TRUE)
+median(allendaleon$no2Conc1HourMean.value, na.rm = TRUE)
+quantile(allendaleon$no2Conc1HourMean.value, na.rm = TRUE)
+sd(allendaleon$no2Conc1HourMean.value, na.rm = TRUE)
+
+#statistics for pm2.5 at allendale when peaker is off
+mean(allendaleoff$pm2_5ConcMass1HourMean.value, na.rm = TRUE)
+median(allendaleoff$pm2_5ConcMass1HourMean.value, na.rm = TRUE)
+quantile(allendaleoff$pm2_5ConcMass1HourMean.value, na.rm = TRUE)
+sd(allendaleoff$pm2_5ConcMass1HourMean.value, na.rm = TRUE)
+
+#statistics for pm10 at allendale when peaker is off
+mean(allendaleoff$pm10ConcMass1HourMean.raw, na.rm = TRUE)
+median(allendaleoff$pm10ConcMass1HourMean.raw, na.rm = TRUE)
+quantile(allendaleoff$pm10ConcMass1HourMean.raw, na.rm = TRUE)
+sd(allendaleoff$pm10ConcMass1HourMean.raw, na.rm = TRUE)
+
+#statistics for no2 at allendale when peaker is off
+mean(allendaleoff$no2Conc1HourMean.value, na.rm = TRUE)
+median(allendaleoff$no2Conc1HourMean.value, na.rm = TRUE)
+quantile(allendaleoff$no2Conc1HourMean.value, na.rm = TRUE)
+sd(allendaleoff$no2Conc1HourMean.value, na.rm = TRUE)
+```
+```{r 8e-output-allendale.csv}
+write.csv(allendale, "data/output/allendale_aq.csv")
+```
+
+
+#PART 2: RUNNING SIMPLE LINEAR MODELS FOR PM2.5, NO2, AND PM10
+
+```{r 9a-run-lm-pm2.5}
+#check variable classes
+allendale$hour <- as.factor(allendale$hour)
+
+#run first linear model
+pm25lm1 <- lm(formula = pm2_5ConcMass1HourMean.value ~ operating_f + 
+                hour + weekday_num, data = allendale)
+
+summary(pm25lm1)
+
+#add in more variables
+
+pm25lm2 <- lm(formula = pm2_5ConcMass1HourMean.value ~ operating_f + 
+                hour + weekday_num + fireworks + smoke, data = allendale)
+
+summary(pm25lm2)
+
+#add in more variables
+
+pm25lm3 <- lm(formula = pm2_5ConcMass1HourMean.value ~ operating_f + 
+                hour + year + weekday_num + fireworks + smoke, data = allendale)
+
+summary(pm25lm3)
+
+#add in more variables
+allendale$HourlyWindSpeed <- as.integer(allendale$HourlyWindSpeed)
+
+pm25lm4 <- lm(formula = pm2_5ConcMass1HourMean.value ~ operating_f + 
+                hour + year + weekday_num + fireworks + smoke + HourlyDryBulbTemperature, 
+              data = allendale)
+
+summary(pm25lm4)
+
+#lm5
+pm25lm5 <- lm(formula = pm2_5ConcMass1HourMean.value ~ operating_f + 
+                hour + year + weekday_num + fireworks + smoke + HourlyDryBulbTemperature + 
+                HourlyRelativeHumidity, data = allendale)
+
+summary(pm25lm5)
+
+#lm6
+
+pm25lm6 <- lm(formula = pm2_5ConcMass1HourMean.value ~ operating_f + 
+                hour + year + weekday_num + fireworks + smoke + HourlyDryBulbTemperature + 
+                HourlyRelativeHumidity + HourlyWindSpeed, data = allendale)
+
+summary(pm25lm6)
+
+```
+
+```{r 9b-run-linear-models-no}
+
+#run first linear model
+no2lm1 <- lm(formula = no2Conc1HourMean.value ~ operating_f + 
+               hour + weekday_num, data = allendale)
+
+summary(no2lm1)
+
+#add in more variables
+
+no2lm2 <- lm(formula = no2Conc1HourMean.value ~ operating_f + 
+               hour + weekday_num + fireworks + smoke, data = allendale)
+
+summary(no2lm2)
+
+#add in more variables
+
+no2lm3 <- lm(formula = no2Conc1HourMean.value ~ operating_f + 
+               hour + year + weekday_num + fireworks + smoke, data = allendale)
+
+summary(no2lm3)
+
+#add in more variables
+
+no2lm4 <- lm(formula = no2Conc1HourMean.value ~ operating_f + 
+               hour + year + weekday_num + fireworks + smoke + HourlyDryBulbTemperature, 
+             data = allendale)
+
+summary(no2lm4)
+
+#lm5
+no2lm5 <- lm(formula = no2Conc1HourMean.value ~ operating_f + 
+               hour + year + weekday_num + fireworks + smoke + HourlyDryBulbTemperature + 
+               HourlyRelativeHumidity, data = allendale)
+
+summary(no2lm5)
+
+#lm6
+
+no2lm6 <- lm(formula = no2Conc1HourMean.value ~ operating_f + 
+               hour + year + weekday_num + fireworks + smoke + HourlyDryBulbTemperature + 
+               HourlyRelativeHumidity + HourlyWindSpeed, data = allendale)
+
+summary(no2lm6)
+
+```
+
+```{r 9c-run linear models for pm10}
+#run first linear model
+pm10lm1 <- lm(formula = pm10ConcMass1HourMean.raw ~ operating_f + 
+                hour + weekday_num, data = allendale)
+
+summary(pm10lm1)
+
+#add in more variables
+
+pm10lm2 <- lm(formula = pm10ConcMass1HourMean.raw ~ operating_f + 
+                hour + weekday_num + fireworks + smoke, data = allendale)
+
+summary(pm10lm2)
+
+#add in more variables
+
+pm10lm3 <- lm(formula = pm10ConcMass1HourMean.raw ~ operating_f + 
+                hour + weekday_num + fireworks + smoke + year, data = allendale)
+
+summary(pm10lm3)
+
+#add in more variables
+
+pm10lm4 <- lm(formula = pm10ConcMass1HourMean.raw ~ operating_f +
+                hour + year + weekday_num + fireworks + smoke + year + HourlyDryBulbTemperature, 
+              data = allendale)
+
+summary(pm10lm4)
+
+#lm5
+pm10lm5 <- lm(formula = pm10ConcMass1HourMean.raw ~ operating_f + 
+                hour + year + weekday_num + fireworks + smoke + year + HourlyDryBulbTemperature + 
+                HourlyRelativeHumidity, data = allendale)
+
+summary(pm10lm5)
+
+#lm6
+
+pm10lm6 <- lm(formula = pm10ConcMass1HourMean.raw ~ operating_f + 
+                hour + year + weekday_num + fireworks + smoke + year + HourlyDryBulbTemperature + 
+                HourlyRelativeHumidity + HourlyWindSpeed, data = allendale)
+
+summary(pm10lm6)
+```
+
+```{r 10a-select linear models }
+#compare linear model results without weather data (lm3) and with weather data (lm6)
+summary(pm25lm3)
+summary(pm25lm6)
+
+summary(pm10lm3)
+summary(pm10lm6)
+
+summary(no2lm3)
+summary(no2lm6)
+```
+
+```{r 10b-plot-residuals-of-models}
+#plot model residuals
+plot(resid(pm25lm3))
+plot(resid(pm10lm3))
+plot(resid(no2lm3))
+
+plot(pm25lm3)
+plot(pm10lm3)
+plot(no2lm3)
+
+
+plot(pm25lm6)
+plot(pm10lm6)
+plot(no2lm6)
+
+
+#they don't look the most normal...
+```
+
+
+```{r 10b-log transforming data running models}
+#does log transforming the models change the model significance we see? 
+#it does not
+
+#pm2.5
+pm25lm3log <- lm(formula = log(pm2_5ConcMass1HourMean.value) ~ operating_f + 
+                   hour + year + weekday_num + fireworks + smoke, data = allendale)
+summary(pm25lm3log)
+
+pm25lm6log <- lm(formula = log(pm2_5ConcMass1HourMean.value) ~ operating_f + 
+                   hour + year + weekday_num + fireworks + smoke + HourlyDryBulbTemperature + HourlyRelativeHumidity + HourlyWindSpeed, data = allendale)
+summary(pm25lm6log)
+
+#PM10
+pm10lm3log <- lm(formula = log(pm10ConcMass1HourMean.raw) ~ operating_f + 
+                   hour + year + weekday_num + fireworks + smoke, data = allendale)
+summary(pm10lm3log)
+
+pm10lm6log <- lm(formula = log(pm10ConcMass1HourMean.raw) ~ operating_f + 
+                   hour + year + weekday_num + fireworks + smoke + HourlyDryBulbTemperature + 
+                   HourlyRelativeHumidity + HourlyWindSpeed, data = allendale)
+summary(pm10lm6log)
+
+#no2
+no2lm3log <- lm(formula = log(allendale$no2Conc1HourMean.value + 1) ~ operating_f + 
+                  hour + year + weekday_num + fireworks + smoke, data = allendale)
+summary(no2lm3log)
+
+no2lm6log <- lm(formula = log(no2Conc1HourMean.value + 1) ~ operating_f + 
+                  hour + year + weekday_num + fireworks + smoke + HourlyDryBulbTemperature + 
+                  HourlyRelativeHumidity + HourlyWindSpeed, data = allendale)
+summary(no2lm6log)
+
+
+```
+
+#PART 3: PREPARING DATA FOR INTERPOLATION
+
+```{r 11- prepare-data-for-interpolation}
+#convert classes for all sensors not just allendale
+sensors_summer_2$hour <- as.factor(sensors_summer_2$hour)
+sensors_summer_2$HourlyWindSpeed <- as.integer(sensors_summer_2$HourlyWindSpeed)
+sensors_summer_2$date <- as.Date(sensors_summer_2$date, format = "%m/%d/%Y")
+sensors_summer_2$year <- format(sensors_summer_2$date, "%Y")
+sensors_summer_2$operating_f <- factor(sensors_summer_2$operating,
+                                levels = c(0, 1),
+                                labels = c("Not operating", "Operating"))
+sensors_summer_2$datetime <- as.POSIXct(
+  paste(sensors_summer_2$date, sensors_summer_2$hour),
+  format = "%Y-%m-%d %H")
+
+#write to a csv. updated December 13.
+write.csv(sensors_summer_2, "data/output/summersensors.csv")
+
+```
+
+
+```{r 12-create-week-column}
+#prepare data for interpolation
+#create a sequential week column of every 7 days
+sensors_summer_2$date <- as.Date(sensors_summer_2$date, format = "%m/%d/%Y")
+
+start <- min(sensors_summer_2$date)
+
+sensors_summer_2$week <- factor(
+  floor(as.numeric(sensors_summer_2$date - start) / 7) + 1
+)
+
+table(sensors_summer_2$week)
+#i see low numbers of observations in week 14 and week 66 because they fall at the tail end. 
+#recode sensor weeks 14 to be part of 13 and week 66 to be part of 65
+sensors_summer_2$week <- recode(sensors_summer_2$week,
+                                "14" = "13",
+                                "66" = "65")
+
+table(sensors_summer_2$week)
+
+#write to a csv.
+write.csv(sensors_summer_2, "data/output/summersensors.csv")
+
+
+``` 
+
+```{r 13-weekly-avgno2-when-operating}
+#calculate the average hourly no2 per week for each sensor when the power plant is on
+#keep the longitude and latitude columns
+#if any of those weeks contains a value of 1 for fireworks 
+#(indicating on or around july 4)
+#put a value of 1 for fireworks2
+
+#if any of those weeks contains a value of 1 for smoke 
+#(indicating air quality alert due to wildfire smoke
+#put a value of 1 for smoke2)
+
+no2_weekly_on <- sensors_summer_2 |> dplyr::filter(operating == 1,
+                                                   !is.na(no2Conc1HourMean.value)) |>
+  group_by(week, datasourceId) |>
+  summarise(
+    lon = first(longitude),
+    lat = first(latitude),
+    no2mean = mean(no2Conc1HourMean.value, na.rm = TRUE),
+    fireworks2 = ifelse(any(fireworks == 1), 1, 0),
+    smoke2 = ifelse(any(smoke == 1), 1, 0),
+    temp = mean(HourlyDryBulbTemperature),
+    humidity = mean(HourlyRelativeHumidity),
+    windspeed = mean(HourlyWindSpeed),
+    n_obs = n(),
+    .groups = "drop"
+  )
+
+table(no2_weekly_on$week)
+
+no2_weekly_on$operating = "Operating"
+
+no2_weekly_on$year = ifelse(no2_weekly_on$week %in% c("1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13"), "2024", "2025")
+
+
+```
+
+```{r 14-no2-when-off}
+#calculate the average hourly no2 per week for each sensor when the power plant is OFF
+#keep the longitude and latitude columns
+#if any of those weeks contains a value of 1 for fireworks 
+#(indicating on or around july 4)
+#put a value of 1 for fireworks2
+#if any of those weeks contains a value of 1 for smoke 
+#(indicating air quality alert due to wildfire smoke
+#put a value of 1 for smoke2)
+no2_weekly_off <- sensors_summer_2 |> dplyr::filter(operating == 0,
+                                                   !is.na(no2Conc1HourMean.value)) |>
+  group_by(week, datasourceId) |>
+  summarise(
+    lon = first(longitude),
+    lat = first(latitude),
+    no2mean = mean(no2Conc1HourMean.value, na.rm = TRUE),
+    fireworks2 = ifelse(any(fireworks == 1), 1, 0),
+    smoke2 = ifelse(any(smoke == 1), 1, 0),
+    temp = mean(HourlyDryBulbTemperature),
+    humidity = mean(HourlyRelativeHumidity),
+    windspeed = mean(HourlyWindSpeed),
+    n_obs = n(),
+    .groups = "drop"
+  )
+
+table(no2_weekly_off$week)
+
+no2_weekly_off$operating = "Not operating"
+no2_weekly_off$year = ifelse(no2_weekly_off$week %in% c("1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13"), "2024", "2025")
+
+#bind rows
+no2 <- bind_rows(no2_weekly_on, no2_weekly_off)
+
+write.csv(no2, "data/output/no2.csv")
+```
+
+#PART 4: INTERPOLATION
+```{r 15-prepare data for interpolation}
+#no2 is the data that we want to use for interpolation
+
+#convert no2 to a spatial object
+no2_sf <-  st_as_sf(no2, coords = c("lon", "lat"), crs=4326)
+no2_26986 <- st_transform(no2_sf, crs = 26986)
+
+#get pittsfield boundaries and other shapefiles
+pittsfield26986 <- sf::read_sf("data/input/pittsfield26986/pittsfield26986.shp")
+peaker26986 <- sf::read_sf("data/input/peaker26986/peaker26986.shp")
+sensors26986 <- sf::read_sf("data/input/sensors26986/sensors26986.shp")
+bg26986 <- sf::read_sf("data/input/pittsfieldbg26986/pittsfieldbg26986.shp")
+airport26986 <- sf::read_sf("data/input/airport26986/airport26986.shp")
+majroads26986 <- sf::read_sf("data/input/majroads26986/majroads26986.shp")
+
+#get population-weighted centroid
+centroid4326 <- st_sf(
+  geometry = st_sfc(st_point(c(-73.24816089, 42.45187495))),
+  crs = st_crs(4326)  # make sure CRS matches the raster
+)
+centroid26986 <- st_transform(centroid4326, st_crs(pittsfield26986))
+
+#plot some points. COME BACK TO THIS
+ggplot(pittsfield26986) + geom_sf(data = pittsfield26986) + 
+geom_sf(data = peaker26986, color = "black", size = 3) +
+  geom_sf(data = centroid26986, color = "blue", size = 5) +
+  geom_sf(data = sensors26986, aes(color = name), shape = 21, size = 3) +
+  labs(title = "Pittsfield City Boundary, sensors, and peaker plant")
+
+
+
+#create a 500m grid 
+grid500 <- sf::st_bbox(pittsfield26986) |> st_as_stars(dx=500) |>
+  st_crop(pittsfield26986)
+
+plot(grid500)
+
+#create a 250m resolution grid
+grid250 <- sf::st_bbox(pittsfield26986) |> st_as_stars(dx=250) |>
+  st_crop(pittsfield26986)
+
+plot(grid250)
+
+#test 2 using the terra package
+#pittsfield_boundary <- pittsfield26986 |> st_cast("MULTILINESTRING")
+#pittsfield_boundary_vect <- terra::vect(pittsfield_boundary)
+
+#pittsfield_raster500 <- terra::rast(
+ # ext(pittsfield_boundary_vect),
+  #resolution = 500,
+  #crs = st_crs(pittsfield_boundary)$proj4string
+#)
+
+#hasValues(pittsfield_raster500)
+
+#raster500 <- as.points(pittsfield_raster500, values = FALSE)
+
+
+``` 
+
+##test interpolating a raster and extracting data at a point with dummy data
+```{r 16-interpolation-test}
+#test idw for no2, no filtering
+#this is with dummy data so won't be scientifically accurate
+idw_test1 <- idw(formula = no2mean ~1,
+                 locations = no2_26986 ,
+                 newdata = grid250,
+                 idp = 1)
+
+names(idw_test1)
+
+plot(idw_test1)["var1.pred"]
+
+summary(idw_test1$var1.pred)
+
+hist(idw_test1$var1.pred) 
+
+st_extract(idw_test1["var1.pred"], centroid26986)
+
+```
+
+##create a function that runs IDW for one group and extracts the value at the population-weighted centroid
+```{r 17-apply-loop-weekly}
+
+#create a for loop that interpolates a raster for when the power plant is ON and for a specific week
+#prepare what I need for the loop
+
+
+wks <-sort(unique(no2_26986$week))
+operating_statuses <- sort(unique(no2_26986$operating))
+
+idw_weekly_results <- list()
+
+idw_rasters <- list()  
+
+row_id <- 1
+
+for(week_id in wks){
+  for(status in operating_statuses){
+    
+    #this filters data for unique combos of week ID and operation status
+    no2group <- no2_26986 |> dplyr::filter(week == week_id, 
+                                           operating == status)
+  
+    #skip if there aren't any points since the power plant doesn't run every week
+    if (nrow(no2group) < 3 || all(is.na(no2group$no2mean))) {
+      next
+    }
+  
+   #run the IDW formula, setting idp = 2
+    idw_group <- gstat::idw(formula = no2mean~1,
+                         locations = no2group,
+                         newdata = grid250,
+                         idp = 2
+                         )
+    
+    idw_df <- as.data.frame(idw_group["var1.pred"], xy = TRUE)
+
+    
+    ggraster <- ggplot() + geom_raster(data = idw_df,
+                                       aes(x = x, y = y, fill = var1.pred)) +
+      geom_sf(data = pittsfield26986, fill = NA, color = "black", linewidth = 1) +
+      geom_sf(data = no2group, aes(color= "Sensors", shape = "Sensors"), size = 2, stroke = 1) +
+      geom_sf(data = centroid26986, aes(color = "Population-weighted centroid", shape = "Population-weighted centroid"), size = 5, stroke = 2) +
+      geom_sf(data = airport26986, aes(color = "Airport", shape = "Airport"), size = 4, stroke = 2) +
+      geom_sf(data = peaker26986, aes(color = "Peaker plant", shape = "Peaker plant"), size = 4, stroke = 2) + 
+      scale_fill_viridis_c(option = "turbo", na.value = NA, limits = c(0, 60)) +
+      scale_color_manual(
+           name = "Locations",
+           values = c("Sensors" = "black","Population-weighted centroid" = "blue", "Airport" = "gray","Peaker plant" = "black")) +
+      scale_shape_manual(
+       name = "Locations",
+        values = c(
+         "Sensors" = 21,
+          "Population-weighted centroid" = 4,
+          "Airport" = 24,
+          "Peaker plant" = 24)) +
+      coord_sf() +
+      labs(title = paste0("Average hourly NO2 levels for Week ", week_id, ": ", status),
+           fill = "NO2 (ppb)") +
+      theme_minimal()
+    
+    print(ggraster)
+    
+    # Clean file name (remove spaces)
+    status_clean <- gsub(" ", "_", status)
+
+    # Construct output file name
+    png_name <- paste0("plots/ggraster_week_", week_id, "_", status_clean, ".png")
+
+    ggsave(
+        filename = png_name,
+        plot     = ggraster,
+        width    = 10,      # inches
+        height   = 8,
+        dpi      = 300      # high resolution
+  )
+
+    raster_name <- paste0("Week_", week_id, "_", status)
+    idw_rasters[[raster_name]] <- idw_group 
+    
+    
+  #extract the value of the raster at the centroid point
+  centroid_no2mean <- st_extract(idw_group["var1.pred"], centroid26986)[[1]] 
+  
+  #assign the covariates to the extracted value for each week and operating status
+  centroidno2 <- no2group |> 
+    sf::st_drop_geometry() |>
+    dplyr::summarise(
+      week = first(week),
+      operating = first(operating),
+      fireworks2 = first(fireworks2),
+      smoke2 = first(smoke2),
+      temp = first(temp),
+      humidity = first(humidity),
+      windspeed = first(windspeed),
+      year = first(year),
+      .groups = "drop"
+    )
+  
+  #create a new column NO2 mean based on the extracted value of the centroid 
+  centroidno2$no2mean <- centroid_no2mean
+  
+  idw_weekly_results[[row_id]] <- centroidno2
+  row_id <- row_id + 1
+  }
+}
+
+
+centroidno2_weekly <- dplyr::bind_rows(idw_weekly_results)
+head(centroidno2_weekly)
+
+```
+
+```{r 17-visualization-for-model2}
+
+ggno2weeklybox <- ggplot(data = centroidno2_weekly, aes(x = factor(operating), y = no2mean)) + 
+  geom_boxplot(na.rm = TRUE) +
+  labs(title = "Mean hourly NO2 levels per week \nat population-weighted centroid",
+       x = "Peaker plant operation status",
+       y = "Concentration (ppb)") +
+  theme_minimal() + 
+  theme(plot.title = element_text(size = 20),
+        axis.title.x = element_text(size = 18), 
+        axis.title.y = element_text(size = 18),
+        axis.text = element_text(size = 16))
+
+ggsave("plots/ggno2weeklyboxplot.png", ggno2weeklybox, height = 6, width = 8, unit = "in")
+
+
+
+```
+
+```{r 18-run-model-2}
+write.csv(centroidno2_weekly, "data/output/centroidno2_weekly.csv")
+
+#model to include weather data. excluded windspeed because 
+model2_lm1 <- lm(formula = no2mean ~ operating + week + smoke2 + 
+                   fireworks2 + humidity + temp, data = centroidno2_weekly)
+
+summary(model2_lm1)
+
+#without weather data.
+model2_lm2 <- lm(formula = no2mean ~operating + week + smoke2 + 
+                   fireworks2, data = centroidno2_weekly)
+summary(model2_lm2)
+
+#check model residuals...
+plot(resid(model2_lm2))
+plot(model2_lm2)
+
+plot(model2_lm1)
+```
+
+```{r 18-preparing-models-for-publication, echo = FALSE}
+#tried outputting models into nice formats using stargazer
+#but the outputs looked too clunky so we didn't end up using them
+
+#library(stargazer)
+
+
+#stargazer(model2_lm2, model2_lm1, type = "html",
+ #         title = "Model 2 Regression Results",
+  #        out = "model2_outputs.html",
+   #       font.size = "normalsize",      
+    #      column.sep.width = "15pt" ,
+     #     depvar.labels = "Average hourly NO2 (micrograms/m3) per week")
+
+library(webshot2)
+
+webshot("model2_outputs.html", 
+        file = "plots/model2_table.png",
+        vwidth = 1000,     # width of output image
+        vheight = 1000,     # height
+        zoom = 3)   
+
+```
+
+```{r 19-get-centroid-as-shapefile}
+#st_write(centroid26986, "data/output/centroid26986.shp")
+
+#sometimes you get an error that centroid26986.shp already exists, which it does
+#so I commented that code out
+```
+
+
+
+```{r 20-get-extra-numbers-for-report}
+#statistics for weekly interpolated no2 levels at the centroid 
+mean(centroidno2_weekly$no2mean, na.rm = TRUE)
+median(centroidno2_weekly$no2mean, na.rm = TRUE)
+quantile(centroidno2_weekly$no2mean, na.rm = TRUE)
+sd(centroidno2_weekly$no2mean, na.rm = TRUE)
+
+centroidno2on <- centroidno2_weekly |> filter(operating == "Operating")
+mean(centroidno2on$no2mean, na.rm = TRUE)
+median(centroidno2on$no2mean, na.rm = TRUE)
+quantile(centroidno2on$no2mean, na.rm = TRUE)
+sd(centroidno2on$no2mean, na.rm = TRUE)
+
+centroidno2off <- centroidno2_weekly |> filter(operating == "Not operating")
+mean(centroidno2off$no2mean, na.rm = TRUE)
+median(centroidno2off$no2mean, na.rm = TRUE)
+quantile(centroidno2off$no2mean, na.rm = TRUE)
+sd(centroidno2off$no2mean, na.rm = TRUE)
+
+```
+
+```{r 21-calculate-distance-allendale-peake0r}
+#check distance from allendale to the peaker plant
+allendale26986 <- sensors26986 |> dplyr::filter(name == "Allendale Elementary School")
+st_distance(allendale26986, airport26986)
+
+#check distance from allendale to centroid 
+st_distance(centroid26986, airport26986)
+
+#st_write(allendale26986, "data/output/allendale26986.shp")
+
+#sometimes you get an error that allendale26986.shp already exists, which it does
+#so I commented the code out 
+```
+
+
+
+
+
+
+
+
+
+
